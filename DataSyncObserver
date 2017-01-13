@@ -28,6 +28,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
 
+//在hbase表中的记录被写入时触发observer，将数据导入elasticsearch
+//参考http://guoze.me/2015/04/23/hbase-observer-sync-elasticsearch/， 同时工程也转自https://github.com/2shou/HBaseObserver
 public class DataSyncObserver extends BaseRegionObserver {
 
     private static Client client = null;
