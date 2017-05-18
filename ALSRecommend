@@ -1,4 +1,4 @@
-package com.userprofile
+package com.*
 
 import java.text.DecimalFormat
 
