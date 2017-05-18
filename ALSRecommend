@@ -92,7 +92,7 @@ object ALSRecommend {
     val hiveContext = new HiveContext(sc) //where dt >= '2016-05-17' and dt <= '2016-07-27'
     val today = DateTime.now.toString.substring(0, 10)
     val sixMonths = (DateTime.now - 6.months).toString.substring(0, 10)
-    val dataDF = hiveContext.sql("select mem_guid, track_content from dw.user_action where access_time > \'" + sixMonths + "\' and dt< \'" + today + "\' and track_name = '1' ")
+    val dataDF = hiveContext.sql("select mem_id, 点击数 from xxxx.user_action where access_time > \'" + sixMonths + "\' and dt< \'" + today + "\' and track_name = '1' ")
     val sqlContext = new SQLContext(sc) //dev:10.202.250.91 online:10.201.201.111
     val memGuidDF = dataDF.select("mem_guid").distinct()
     val smSeqDF = dataDF.select("track_content").distinct()
@@ -205,9 +205,9 @@ userFactors.lookup(userId).headOption.fold(Map.empty[String, Float]) { user =>
     //    })
     //    val memGuid = userBiMap.inverse.get(460)
     //    println("mem_guid= " + memGuid)
-    val smNameDF =  hiveContext.sql("select sm_seq, sm_title, cp_seq from fn.fn_product_info")
-    //    val smTitleDF = hiveContext.sql("select a.sm_title from fn.fn_product_info a where a.sm_seq in ( track_content from dw.user_action where mem_guid = \'" + memGuid + "\' and access_time > \'" + sixMonths + "\' and dt< \'" + today + "\' and track_name = '1' )")
-    //    val smTitleDF = smNameDF.join(smSeqDF1, smNameDF("sm_seq") === smSeqDF1("track_content"), "leftsemi").select(smNameDF("sm_title"))
+    val smNameDF =  hiveContext.sql("select sm_seq, sm_title, cp_seq from xx.产品信息表")
+    //    val smTitleDF = hiveContext.sql("select a.sm_title from xx.产品信息表 a where a.sm_seq in ( track_content from xx.user_action where mem_id = \'" + memGuid + "\' and access_time > \'" + sixMonths + "\' and dt< \'" + today + "\' and track_name = '1' )")
+    //    val smTitleDF = smNameDF.join(smSeqDF1, smNameDF("sm_seq") === smSeqDF1("xxx"), "leftsemi").select(smNameDF("sm_title"))
     //    val predictions = model.transform (ratingDF.where(ratingDF("userId") === userBiMap.get("4916E052-0E88-7A7F-4584-B19C82ABBB91").getOrElse(-1)))
     //    predictions.show()
     //    val itemPredictionsDF = predictions.select(predictions("itemId"), predictions("prediction"))
@@ -258,9 +258,8 @@ userFactors.lookup(userId).headOption.fold(Map.empty[String, Float]) { user =>
     //      println(e._1+"|||"+e._2)
     //    })
 
-    getSimProduct(sqlContext, idFactor, smNameDF, itemBiMap, "201503CM070004462")
-    getSimProduct(sqlContext, idFactor, smNameDF, itemBiMap, "201608CM220001521")
-    getSimProduct(sqlContext, idFactor, smNameDF, itemBiMap, "201503CM050000620")
+    getSimProduct(sqlContext, idFactor, smNameDF, itemBiMap, "xxxxx")
+
     //.sortBy(x => x._2).map{case (x:Int, y:Double) => Row(itemBiMap.inverse.get(x).getOrElse(""))}
 
     //    val sortedSims2 = sc.parallelize(sims.top(100 + 1)(Ordering.by[(Int, Double), Double] { case (id, similarity) => similarity }))
