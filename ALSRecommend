@@ -1,0 +1,325 @@
+package com.userprofile
+
+import java.text.DecimalFormat
+
+import com.github.nscala_time.time.Imports._
+import org.apache.spark.ml.evaluation.RegressionEvaluator
+import org.apache.spark.ml.recommendation.ALS
+import org.apache.spark.serializer.JavaSerializer
+import org.apache.spark.sql.hive.HiveContext
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.{DataFrame, Row, SQLContext}
+import org.apache.spark.{AccumulableParam, SparkConf, SparkContext}
+import com.google.common.{collect => guava}
+import org.apache.spark.ml.recommendation.ALS.Rating
+import org.apache.spark.rdd.RDD
+import org.jblas.DoubleMatrix
+
+import scala.collection.mutable.{ArrayBuffer, Map}
+import scala.languageFeature.implicitConversions
+class BiMap[A,B] extends BiMapHelper(Map[A,B](), Map[B,A]()) {
+}
+
+object BiMap extends Serializable{
+  def apply[A,B](elems:(A,B)*) = new BiMap[A,B] ++= elems
+}
+/**
+  * This allows a bi-directional map to be created from any two maps.
+  * These maps must be the inverse of each other to work.
+  */
+class BiMapHelper[A,B](forward:Map[A,B], backward:Map[B,A]) extends Map[A,B] with Serializable {
+  def inverse = new BiMapHelper(backward, forward)
+  def get(key:A) = forward get key
+  def iterator = forward.iterator
+  def +=(kv:(A,B)) = {
+    forward += kv
+    backward += kv.swap
+    this
+  }
+  def -=(key:A) = {
+    backward --= (forward get key)
+    forward -= key
+    this
+  }
+  override def empty = {
+    forward.empty
+    backward.empty
+    this
+  }
+  override def size = forward.size
+}
+
+object BiMapHelper extends Serializable {
+  def apply[A,B](forward:Map[A,B], backward:Map[B,A]) = new BiMapHelper(forward, backward)
+}
+/*
+class MutableBiMap[A, B] private (
+                                   private val g: guava.BiMap[A, B] = new guava.HashBiMap[A, B]()) {
+  def inverse: MutableBiMap[B, A] = new MutableBiMap[B, A](g.inverse)
+}
+
+object MutableBiMap {
+  def empty[A, B]: MutableBiMap[A, B] = new MutableBiMap
+  implicit def toMap[A, B] (x: MutableBiMap[A, B]): mutable.Map[A,B] = x.g
+}*/
+
+class BiMapParam extends AccumulableParam[BiMap[String, Int], (String, Int)] {
+  def addAccumulator(acc: BiMap[String, Int], elem: (String, Int)): BiMap[String, Int] = {
+    val (k1, v1) = elem
+    acc += (elem)
+    acc
+  }
+
+  def addInPlace(acc1: BiMap[String, Int], acc2: BiMap[String, Int]): BiMap[String, Int] = {
+    acc2.foreach(elem => addAccumulator(acc1, elem))
+    acc1
+  }
+
+  def zero(initialValue: BiMap[String, Int]): BiMap[String, Int] = {
+    val ser = new JavaSerializer(new SparkConf(false)).newInstance()
+    val copy = ser.deserialize[BiMap[String, Int]](ser.serialize(initialValue))
+    copy.clear()
+    copy
+  }
+}
+
+object ALSRecommend {
+  def main(args:Array[String]): Unit = {
+    val esUrl = "10.201.201.111:9200"
+    val sparkConf = new SparkConf().setAppName("toHBase_sunyu").set("spark.serializer", "org.apache.spark.serializer.KryoSerializer").set("spark.kryoserializer.buffer.max", "192M")
+      .set("spark.driver.maxResultSize", "4G").set("spark.default.parallelism","1024")//.set("spark.task.cpus", "4")
+    val sc = new SparkContext(sparkConf)
+    val hiveContext = new HiveContext(sc) //where dt >= '2016-05-17' and dt <= '2016-07-27'
+    val today = DateTime.now.toString.substring(0, 10)
+    val sixMonths = (DateTime.now - 6.months).toString.substring(0, 10)
+    val dataDF = hiveContext.sql("select mem_guid, track_content from dw.user_action where access_time > \'" + sixMonths + "\' and dt< \'" + today + "\' and track_name = '1' ")
+    val sqlContext = new SQLContext(sc) //dev:10.202.250.91 online:10.201.201.111
+    val memGuidDF = dataDF.select("mem_guid").distinct()
+    val smSeqDF = dataDF.select("track_content").distinct()
+    var memGuidCount = -1
+    val userStringIntMap = new BiMap[String, Int]
+    val accumulatorUser = sc.accumulable(userStringIntMap)(new BiMapParam)
+    memGuidDF.foreach( row => {
+      memGuidCount+=1
+      accumulatorUser += (row.getString(0),memGuidCount)
+    })
+
+    var smSeqCount = -1
+    val itemStringIntMap = new BiMap[String, Int]
+    val accumulatorItem = sc.accumulable(itemStringIntMap)(new BiMapParam)
+    smSeqDF.foreach( row => {
+      smSeqCount+=1
+      accumulatorItem += (row.getString(0),smSeqCount)
+    })
+
+    println("accumulatorUser.value="+accumulatorUser.value.size)
+    val userBiMap = sc.broadcast(accumulatorUser.value).value
+    val itemBiMap = sc.broadcast(accumulatorItem.value).value
+    val ratingRDD = dataDF.map( line => {
+      ((userBiMap.get(line.getString(0)).get, itemBiMap.get(line.getString(1)).get) ,1.0)
+    }).filter{ case ((u, i), c) => (u != -1) && (i != -1) }
+      .reduceByKey(_ + _)
+      .map { case ((u, i), c) =>
+        Row(u, i, c)
+      }
+
+    val ratingStruct = new StructType(Array(StructField("userId", IntegerType, nullable = false), StructField("itemId", IntegerType, nullable = false), StructField("rating", DoubleType, nullable = true)))
+    val ratingDF = sqlContext.createDataFrame(ratingRDD, ratingStruct)
+
+    val Array(training, test) = ratingDF.randomSplit(Array(0.8, 0.2))
+    val als = new ALS()
+      .setMaxIter(100)
+      .setRegParam(0.01)
+      .setUserCol("userId")
+      .setItemCol("itemId")
+      .setRatingCol("rating")
+
+    //加以下2行，防止stackoverflowerror
+    sc.setCheckpointDir("checkpoint/")
+    als.setCheckpointInterval(2)
+    //    val model = ALS.train(ratingRDD, 10, 100, 0.01)
+    //    model.recommendUsers(1111,10).foreach(println)
+
+    val model = als.fit(ratingDF)
+    //    model.userFactors.show(100)
+    //    model.itemFactors.show(100)
+
+    //    val predictions = model.transform(test)
+    //predictions.show(100)
+
+
+    //    val evaluator = new RegressionEvaluator()
+    //      .setMetricName("rmse")
+    //      .setLabelCol("rating")
+    //      .setPredictionCol("prediction")
+    //
+    //    val rmse = evaluator.evaluate(predictions)
+    //    println(s"Root-mean-square error = " + rmse)
+
+    /*
+userFactors.lookup(userId).headOption.fold(Map.empty[String, Float]) { user =>
+
+  val ratings = itemFactors.map { case (id, features) =>
+    val rating = blas.sdot(features.length, user, 1, features, 1)
+    (id, rating)
+  }
+
+  ratings.sortBy(_._2).take(numResults).toMap
+}*/
+
+    /*import com.github.fommil.netlib.BLAS.{getInstance => blas}
+
+    val userFactors = model.userFactors
+ val itemFactors = sc.broadcast(model.itemFactors.collect()).value
+
+ itemFactors.foreach( y => {
+   val wholeStr = y.get(1).toString
+   println(wholeStr)
+   val pos1 = wholeStr.lastIndexOf(")")
+   val pos2 = wholeStr.lastIndexOf("(")
+   val yx = for(str <- wholeStr.substring(pos2+1, pos1).split(",")) yield {
+     new java.math.BigDecimal(str.trim).toPlainString().toFloat
+   }
+   yx.foreach(println)
+ })*/
+
+    //    userFactors.limit(3).foreach(x => {
+    //      println("mem_guid= " + userBiMap.inverse.get(x.getInt(0)))
+    //      val wholeStr = x.get(1).toString
+    //      val pos1 = wholeStr.lastIndexOf(")")
+    //      val pos2 = wholeStr.lastIndexOf("(")
+    //      val sx = for (str <- wholeStr.substring(pos2 + 1, pos1).split(",")) yield new java.math.BigDecimal(str.trim).toPlainString().toFloat
+    //      val ratings = itemFactors.map(y => {
+    //        //features.length, user, 1, features, 1 abstract public float More ...sdot(int n, float[] sx, int incx, float[] sy, int incy);
+    //        val id = y.getInt(0)
+    //        val wholeStr_y = y.get(1).toString
+    //        val pos1_y = wholeStr_y.lastIndexOf(")")
+    //        val pos2_y = wholeStr_y.lastIndexOf("(")
+    //        val yx = for (str <- wholeStr_y.substring(pos2_y + 1, pos1_y).split(",")) yield {
+    //          new java.math.BigDecimal(str.trim).toPlainString().toFloat
+    //        }
+    //        val rating = blas.sdot(yx.length, sx, 1, yx, 1)
+    //        (id, rating)
+    //      })
+    //      ratings.foreach(e => println(itemBiMap.inverse.get(e._1) + "= " + e._2))
+    //    })
+    //    val memGuid = userBiMap.inverse.get(460)
+    //    println("mem_guid= " + memGuid)
+    val smNameDF =  hiveContext.sql("select sm_seq, sm_title, cp_seq from fn.fn_product_info")
+    //    val smTitleDF = hiveContext.sql("select a.sm_title from fn.fn_product_info a where a.sm_seq in ( track_content from dw.user_action where mem_guid = \'" + memGuid + "\' and access_time > \'" + sixMonths + "\' and dt< \'" + today + "\' and track_name = '1' )")
+    //    val smTitleDF = smNameDF.join(smSeqDF1, smNameDF("sm_seq") === smSeqDF1("track_content"), "leftsemi").select(smNameDF("sm_title"))
+    //    val predictions = model.transform (ratingDF.where(ratingDF("userId") === userBiMap.get("4916E052-0E88-7A7F-4584-B19C82ABBB91").getOrElse(-1)))
+    //    predictions.show()
+    //    val itemPredictionsDF = predictions.select(predictions("itemId"), predictions("prediction"))
+    //    val itemIdSortRDD = itemPredictionsDF.orderBy(itemPredictionsDF("prediction").desc).map(x => {
+    //      Row(itemBiMap.inverse.get(x.getInt(0)))
+    //    })
+    //    val itemIdSortStruct = new StructType(Array(StructField("itemId", StringType, nullable = false)))
+    //    val itemIdSortDF = sqlContext.createDataFrame(itemIdSortRDD, itemIdSortStruct)
+    //    val smTitleDF1 = smNameDF.join(itemIdSortDF, smNameDF("sm_seq") === itemIdSortDF("itemId"), "leftsemi").select(smNameDF("cp_seq"), smNameDF("sm_title").alias("sm_title1")).orderBy("cp_seq")//rdd.groupBy(x=>x.getString(0))
+    //    println("smTitleDF1_Count="+smTitleDF1.count())
+    //    smTitleDF1.show(smTitleDF1.count().toInt)
+    //itemPredictionsDF.orderBy(itemPredictionsDF("prediction").desc)
+    //      .limit(30)
+    //.map { case Row (itemId: Int, prediction: Double) => (itemId, prediction) }
+    //.collect().foreach(e => println(itemBiMap.inverse.get(e.getInt(0)).getOrElse("test")+"="+e.getFloat(1)))
+
+    //    println(itemMatrix.rows, itemMatrix.columns)
+
+    /*userFactors.where(userFactors("id") === 460).foreach( line => {
+      val userId = line.getInt(0)
+      val array = line.get(1).toString
+      val pos1 = array.lastIndexOf(")")
+      val pos2 = array.lastIndexOf("(")
+      val factorArr = for (str <- array.substring(pos2 + 1, pos1).split(",")) yield new java.math.BigDecimal(str.trim).toPlainString().toDouble
+      val userVector = new DoubleMatrix(factorArr)
+      val scores = imBroadcast.value.mmul(userVector)
+      val sortedWithId = scores.data.zipWithIndex.sortBy(-_._1)
+      val recommendedIds = sortedWithId.map(_._2 + 1).toSeq
+      println(userId+" == "+recommendedIds.foreach(println))
+    })
+*/
+
+    /* Compute the cosine similarity between two vectors */
+    def cosineSimilarity(vec1: DoubleMatrix, vec2: DoubleMatrix): Double = {
+      vec1.dot(vec2) / (vec1.norm2() * vec2.norm2())
+    }
+    val idFactor = model.itemFactors.map(line => {
+      val id= line.getInt(0)
+      val factor = line.get(1).toString
+      val pos1 = factor.lastIndexOf(")")
+      val pos2 = factor.lastIndexOf("(")
+      val factorArray = for (str <- factor.substring(pos2 + 1, pos1).split(",")) yield new java.math.BigDecimal(str.trim).toPlainString().toDouble
+      val factorVector = new DoubleMatrix(factorArray)
+      //      val sim = cosineSimilarity(factorVector, imBroadcast.value)
+      (id, factorVector)
+    })
+    //    idFactor.collect().foreach(e => {
+    //      println(e._1+"|||"+e._2)
+    //    })
+
+    getSimProduct(sqlContext, idFactor, smNameDF, itemBiMap, "201503CM070004462")
+    getSimProduct(sqlContext, idFactor, smNameDF, itemBiMap, "201608CM220001521")
+    getSimProduct(sqlContext, idFactor, smNameDF, itemBiMap, "201503CM050000620")
+    //.sortBy(x => x._2).map{case (x:Int, y:Double) => Row(itemBiMap.inverse.get(x).getOrElse(""))}
+
+    //    val sortedSims2 = sc.parallelize(sims.top(100 + 1)(Ordering.by[(Int, Double), Double] { case (id, similarity) => similarity }))
+    //  //  println(sortedSims2.slice(1, 11).mkString("\n"))
+    //    val itemSimRDD = sortedSims2.map(e => {
+    //      Row(itemBiMap.inverse.get(e._1))
+    //    })
+    //    val itemSimDF = sqlContext.createDataFrame(itemSimRDD, itemSimStruct)
+    //    val specificSimDF = sqlContext.createDataFrame(specificSimRDD1, itemSimStruct)
+    //    println("count=="+specificSimRDD1.count())
+    //    val smTitleDF2 = smNameDF.join(itemSimDF, smNameDF("sm_seq") === itemSimDF("itemId"), "leftsemi").select(smNameDF("cp_seq"), smNameDF("sm_title").alias("sm_title2")).orderBy("cp_seq")//.rdd.groupBy(x=>x.getString(0))
+    //    smTitleDF2.show(101)
+    //    val smTitleDF3 = smNameDF.join(specificSimDF, smNameDF("sm_seq") === specificSimDF("itemId"), "leftsemi").select(smNameDF("cp_seq"), smNameDF("sm_title").alias("sm_title2")).orderBy("cp_seq")//.rdd.groupBy(x=>x.getString(0))
+    //    smTitleDF3.show(500)
+    /*
+        val top10Products = userFactors.where(userFactors("id") === 460).map(x => {
+          val id = x.getInt(0)
+          val wholeStr = x.get(1).toString
+          val pos1 = wholeStr.lastIndexOf(")")
+          val pos2 = wholeStr.lastIndexOf("(")
+          val sx = for(str <- wholeStr.substring(pos2+1, pos1).split(",")) yield new java.math.BigDecimal(str.trim).toPlainString().toFloat
+          val ratings = itemFactors.map ( y => {        //features.length, user, 1, features, 1 abstract public float More ...sdot(int n, float[] sx, int incx, float[] sy, int incy);
+            val wholeStr = y.get(1).toString
+            val pos1 = wholeStr.lastIndexOf(")")
+            val pos2 = wholeStr.lastIndexOf("(")
+            val yx = for(str <- wholeStr.substring(pos2+1, pos1).split(",")) yield {
+              new java.math.BigDecimal(str.trim).toPlainString().toFloat
+            }
+            val rating = blas.sdot(sx.length, sx, 1, yx, 1)
+            (id, rating)
+          })
+          //ratings.sortBy(_._2).take(10).toMap
+          ratings
+        })
+        top10Products.foreach(e=> {
+          e.foreach(x => println(x._1+"=="+x._2))
+        })*/
+
+  }
+  def getSimProduct(sqlContext:SQLContext, idFactor: RDD[(Int, DoubleMatrix)], smNameDF:DataFrame, itemBiMap:BiMap[String, Int], itemIdStr:String): Unit = {
+    def cosineSimilarity(vec1: DoubleMatrix, vec2: DoubleMatrix): Double = {
+      vec1.dot(vec2) / (vec1.norm2() * vec2.norm2())
+    }
+    val simArr = new ArrayBuffer[Double]()
+    val specificSimRDD1 = idFactor.filter(_._1 == itemBiMap.get(itemIdStr).getOrElse(-1))
+    println("specificSimRDD1_c="+specificSimRDD1.count() + "  idInt=" + itemBiMap.get(itemIdStr).getOrElse(-1))
+    val specificSimArr = specificSimRDD1.collect()
+    val simRDD = idFactor.map( e => {
+      ( e._1, cosineSimilarity(specificSimArr(0)._2, e._2))
+    }).sortBy(x => x._2, false)
+    val simStrRDD = simRDD.map(x => {
+      Row(itemBiMap.inverse.get(x._1).getOrElse(""), x._2)
+    })
+    val itemSimStruct = new StructType(Array(StructField("itemId", StringType, nullable = false), StructField("rating", DoubleType, nullable = false)))
+    val itemSimDF = sqlContext.createDataFrame(simStrRDD, itemSimStruct)
+    //    val smTitleDF2 = smNameDF.join(itemSimDF, smNameDF("sm_seq") === itemSimDF("itemId"), "leftsemi").select(smNameDF("cp_seq"), smNameDF("sm_title").alias("sm_title2")).orderBy("cp_seq")//.rdd.groupBy(x=>x.getString(0))
+    //    smTitleDF2.show(smTitleDF2.count().toInt)
+    val smTitleDF3 = smNameDF.join(itemSimDF, smNameDF("sm_seq") === itemSimDF("itemId")).select(smNameDF("cp_seq"), smNameDF("sm_seq"), smNameDF("sm_title").alias("sm_title3"), itemSimDF("rating"))
+    val smTitleDF4 = smTitleDF3.sort(smTitleDF3("cp_seq"), smTitleDF3("rating").desc)
+    smTitleDF4.show(smTitleDF4.count().toInt)
+  }
+}
