@@ -86,16 +86,16 @@ class BiMapParam extends AccumulableParam[BiMap[String, Int], (String, Int)] {
 object ALSRecommend {
   def main(args:Array[String]): Unit = {
     val esUrl = "10.201.201.111:9200"
-    val sparkConf = new SparkConf().setAppName("toHBase_sunyu").set("spark.serializer", "org.apache.spark.serializer.KryoSerializer").set("spark.kryoserializer.buffer.max", "192M")
+    val sparkConf = new SparkConf().setAppName("").set("spark.serializer", "org.apache.spark.serializer.KryoSerializer").set("spark.kryoserializer.buffer.max", "192M")
       .set("spark.driver.maxResultSize", "4G").set("spark.default.parallelism","1024")//.set("spark.task.cpus", "4")
     val sc = new SparkContext(sparkConf)
     val hiveContext = new HiveContext(sc) //where dt >= '2016-05-17' and dt <= '2016-07-27'
     val today = DateTime.now.toString.substring(0, 10)
     val sixMonths = (DateTime.now - 6.months).toString.substring(0, 10)
-    val dataDF = hiveContext.sql("select mem_id, 点击数 from xxxx.user_action where access_time > \'" + sixMonths + "\' and dt< \'" + today + "\' and track_name = '1' ")
-    val sqlContext = new SQLContext(sc) //dev:10.202.250.91 online:10.201.201.111
-    val memGuidDF = dataDF.select("mem_guid").distinct()
-    val smSeqDF = dataDF.select("track_content").distinct()
+    val dataDF = hiveContext.sql("select mem_id, item_id from xxxx.user_action where access_time > \'" + sixMonths + "\' and dt< \'" + today + "\' and track_name = '1' ")
+    val sqlContext = new SQLContext(sc) 
+    val memGuidDF = dataDF.select("mem_id").distinct()
+    val smSeqDF = dataDF.select("item_id").distinct()
     var memGuidCount = -1
     val userStringIntMap = new BiMap[String, Int]
     val accumulatorUser = sc.accumulable(userStringIntMap)(new BiMapParam)
@@ -178,6 +178,7 @@ userFactors.lookup(userId).headOption.fold(Map.empty[String, Float]) { user =>
    val pos1 = wholeStr.lastIndexOf(")")
    val pos2 = wholeStr.lastIndexOf("(")
    val yx = for(str <- wholeStr.substring(pos2+1, pos1).split(",")) yield {
+   //这种方式将string转为float或double，直接toFloat不行
      new java.math.BigDecimal(str.trim).toPlainString().toFloat
    }
    yx.foreach(println)
@@ -205,9 +206,9 @@ userFactors.lookup(userId).headOption.fold(Map.empty[String, Float]) { user =>
     //    })
     //    val memGuid = userBiMap.inverse.get(460)
     //    println("mem_guid= " + memGuid)
-    val smNameDF =  hiveContext.sql("select sm_seq, sm_title, cp_seq from xx.产品信息表")
-    //    val smTitleDF = hiveContext.sql("select a.sm_title from xx.产品信息表 a where a.sm_seq in ( track_content from xx.user_action where mem_id = \'" + memGuid + "\' and access_time > \'" + sixMonths + "\' and dt< \'" + today + "\' and track_name = '1' )")
-    //    val smTitleDF = smNameDF.join(smSeqDF1, smNameDF("sm_seq") === smSeqDF1("xxx"), "leftsemi").select(smNameDF("sm_title"))
+    val smNameDF =  hiveContext.sql("select 商品id, 商品名称, 分类id from xx.产品信息表")
+    //    val smTitleDF = hiveContext.sql("select a.商品名称 from xx.产品信息表 a where a.商品id in ( 商品id from xx.user_action where mem_id = \'" + mem_id + "\' and access_time > \'" + sixMonths + "\' and dt< \'" + today + "\' and track_name = '1' )")
+    //    val smTitleDF = smNameDF.join(smSeqDF1, smNameDF("sm_seq") === smSeqDF1("xxx"), "leftsemi").select(smNameDF("商品名称"))
     //    val predictions = model.transform (ratingDF.where(ratingDF("userId") === userBiMap.get("4916E052-0E88-7A7F-4584-B19C82ABBB91").getOrElse(-1)))
     //    predictions.show()
     //    val itemPredictionsDF = predictions.select(predictions("itemId"), predictions("prediction"))
@@ -216,7 +217,7 @@ userFactors.lookup(userId).headOption.fold(Map.empty[String, Float]) { user =>
     //    })
     //    val itemIdSortStruct = new StructType(Array(StructField("itemId", StringType, nullable = false)))
     //    val itemIdSortDF = sqlContext.createDataFrame(itemIdSortRDD, itemIdSortStruct)
-    //    val smTitleDF1 = smNameDF.join(itemIdSortDF, smNameDF("sm_seq") === itemIdSortDF("itemId"), "leftsemi").select(smNameDF("cp_seq"), smNameDF("sm_title").alias("sm_title1")).orderBy("cp_seq")//rdd.groupBy(x=>x.getString(0))
+    //    val smTitleDF1 = smNameDF.join(itemIdSortDF, smNameDF("商品id") === itemIdSortDF("itemId"), "leftsemi").select(smNameDF("分类id"), smNameDF("商品名称").alias("商品名称1")).orderBy("分类id")//rdd.groupBy(x=>x.getString(0))
     //    println("smTitleDF1_Count="+smTitleDF1.count())
     //    smTitleDF1.show(smTitleDF1.count().toInt)
     //itemPredictionsDF.orderBy(itemPredictionsDF("prediction").desc)
@@ -270,9 +271,9 @@ userFactors.lookup(userId).headOption.fold(Map.empty[String, Float]) { user =>
     //    val itemSimDF = sqlContext.createDataFrame(itemSimRDD, itemSimStruct)
     //    val specificSimDF = sqlContext.createDataFrame(specificSimRDD1, itemSimStruct)
     //    println("count=="+specificSimRDD1.count())
-    //    val smTitleDF2 = smNameDF.join(itemSimDF, smNameDF("sm_seq") === itemSimDF("itemId"), "leftsemi").select(smNameDF("cp_seq"), smNameDF("sm_title").alias("sm_title2")).orderBy("cp_seq")//.rdd.groupBy(x=>x.getString(0))
+    //    val smTitleDF2 = smNameDF.join(itemSimDF, smNameDF("商品id") === itemSimDF("itemId"), "leftsemi").select(smNameDF("分类id"), smNameDF("商品名称").alias("商品名称2")).orderBy("分类id")//.rdd.groupBy(x=>x.getString(0))
     //    smTitleDF2.show(101)
-    //    val smTitleDF3 = smNameDF.join(specificSimDF, smNameDF("sm_seq") === specificSimDF("itemId"), "leftsemi").select(smNameDF("cp_seq"), smNameDF("sm_title").alias("sm_title2")).orderBy("cp_seq")//.rdd.groupBy(x=>x.getString(0))
+    //    val smTitleDF3 = smNameDF.join(specificSimDF, smNameDF("商品id") === specificSimDF("itemId"), "leftsemi").select(smNameDF("分类id"), smNameDF("商品名称").alias("商品名称2")).orderBy("分类id")//.rdd.groupBy(x=>x.getString(0))
     //    smTitleDF3.show(500)
     /*
         val top10Products = userFactors.where(userFactors("id") === 460).map(x => {
@@ -315,10 +316,10 @@ userFactors.lookup(userId).headOption.fold(Map.empty[String, Float]) { user =>
     })
     val itemSimStruct = new StructType(Array(StructField("itemId", StringType, nullable = false), StructField("rating", DoubleType, nullable = false)))
     val itemSimDF = sqlContext.createDataFrame(simStrRDD, itemSimStruct)
-    //    val smTitleDF2 = smNameDF.join(itemSimDF, smNameDF("sm_seq") === itemSimDF("itemId"), "leftsemi").select(smNameDF("cp_seq"), smNameDF("sm_title").alias("sm_title2")).orderBy("cp_seq")//.rdd.groupBy(x=>x.getString(0))
+    //    val smTitleDF2 = smNameDF.join(itemSimDF, smNameDF("商品id") === itemSimDF("itemId"), "leftsemi").select(smNameDF("分类id"), smNameDF("商品名称").alias("商品名称2")).orderBy("分类id")//.rdd.groupBy(x=>x.getString(0))
     //    smTitleDF2.show(smTitleDF2.count().toInt)
-    val smTitleDF3 = smNameDF.join(itemSimDF, smNameDF("sm_seq") === itemSimDF("itemId")).select(smNameDF("cp_seq"), smNameDF("sm_seq"), smNameDF("sm_title").alias("sm_title3"), itemSimDF("rating"))
-    val smTitleDF4 = smTitleDF3.sort(smTitleDF3("cp_seq"), smTitleDF3("rating").desc)
+    val smTitleDF3 = smNameDF.join(itemSimDF, smNameDF("商品id") === itemSimDF("itemId")).select(smNameDF("分类id"), smNameDF("商品id"), smNameDF("商品名称").alias("商品名称3"), itemSimDF("rating"))
+    val smTitleDF4 = smTitleDF3.sort(smTitleDF3("分类id"), smTitleDF3("rating").desc)
     smTitleDF4.show(smTitleDF4.count().toInt)
   }
 }
