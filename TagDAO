@@ -1,0 +1,164 @@
+package com.feiniu.bigdata.recommend.dao.impl;
+
+import com.feiniu.bigdata.recommend.commons.log.LogBetter;
+import com.feiniu.bigdata.recommend.commons.log.LogLevel;
+import com.feiniu.bigdata.recommend.commons.utils.PropertiesUtil;
+import com.feiniu.bigdata.recommend.dao.RedisDAO;
+import com.feiniu.bigdata.recommend.dao.TagDAO;
+import com.feiniu.bigdata.recommend.utils.ShardedRedisPools;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.TableName;
+import org.apache.hadoop.hbase.client.*;
+import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.security.UserGroupInformation;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Repository;
+
+import javax.annotation.PreDestroy;
+import javax.annotation.Resource;
+import java.io.IOException;
+
+import static org.apache.commons.lang3.SystemUtils.FILE_SEPARATOR;
+
+/**
+ * HBase数据访问
+ * <p>
+ */
+@Repository("tagDAO")
+public class TagDAOImpl implements TagDAO {
+    private static final Logger LOGGER = LoggerFactory.getLogger(TagDAOImpl.class);
+
+    @Resource
+    private RedisDAO redisDAO;
+
+    private static final String TABLE_NAME = "xx_recom:xx_user";
+    private static final String COLUMN_FAMILY = "tag";
+    private static final String BRAND_QUALIFIER = "br_prefer";
+    private static final String CATEGORY_QUALIFIER = "cc_brand_prefer";
+    private static final String LEVEL1CATEGORY_QUALIFIER = "cat1top10";
+
+    private static Connection connection = null;
+    private static Table table = null;
+
+    private static void loadDataFromConfig() {
+        PropertiesUtil.load("/config/config.properties");
+        String hbaseConfigFile = PropertiesUtil.getString("config.file.path") + FILE_SEPARATOR + "hbaseConfig.properties";
+        PropertiesUtil.loadFromFileSystem(hbaseConfigFile);
+    }
+
+    private static Connection getConnection() throws IOException{
+        Configuration archHBaseConfig = HBaseConfiguration.create();
+        loadDataFromConfig();
+        archHBaseConfig.set("hbase.zookeeper.quorum", PropertiesUtil.getString("arch.hbase.zookeeper.quorum"));
+        archHBaseConfig.set("hbase.zookeeper.master", PropertiesUtil.getString("arch.hbase.zookeeper.master"));
+        archHBaseConfig.set("hadoop.security.authentication", "kerberos");
+        archHBaseConfig.set("hbase.security.authentication", "kerberos");
+        String archHbasePrincipal = PropertiesUtil.getString("arch.hbase.principal");
+        archHBaseConfig.set("hbase.master.kerberos.principal", archHbasePrincipal);
+        archHBaseConfig.set("hbase.regionserver.kerberos.principal", archHbasePrincipal);
+        UserGroupInformation.setConfiguration(archHBaseConfig);
+        UserGroupInformation.loginUserFromKeytab("bd_recom", "/home/webdata/bd_recom.keytab");
+        return ConnectionFactory.createConnection(archHBaseConfig);
+    }
+
+    static {
+        Admin admin = null;
+        try {
+            connection = getConnection();
+            TableName tableName = TableName.valueOf(TABLE_NAME);
+            table = connection.getTable(tableName);
+            admin = connection.getAdmin();
+            boolean isTableExist = admin.tableExists(tableName);
+            LogBetter.instance(LOGGER).setLevel(LogLevel.INFO).setMsg("TagDAOImpl_getResult_table:" + isTableExist).log();
+            if (!isTableExist) {
+                LogBetter.instance(LOGGER).setLevel(LogLevel.INFO).setMsg("TagDAOImpl_getResult_table doesn't exist").log();
+            }
+        } catch (Throwable e) {
+            LogBetter.instance(LOGGER).setLevel(LogLevel.ERROR).setMsg("getConnection_TagDAOImpl="+e.getStackTrace()).log();
+        } finally {
+            if (admin != null) {
+                try {
+                    admin.close();
+                    admin = null;
+                } catch (Throwable e) {
+                    LogBetter.instance(LOGGER).setLevel(LogLevel.ERROR).setMsg("close_admin_TagDAOImpl="+e.getStackTrace()).log();
+                }
+            }
+        }
+    }
+
+    @PreDestroy
+    public void cleanUp() throws IOException {
+        table.close();
+        connection.close();
+        LogBetter.instance(LOGGER).setLevel(LogLevel.ERROR).setMsg("Spring Container is destroy! Customer clean up").log();
+    }
+
+    @Override
+    public String getBrandPreference(String memGuid) throws IOException {
+        LogBetter.instance(LOGGER).setLevel(LogLevel.INFO).setMsg("getBrandPreference_TagDAOImpl="+memGuid).log();
+        return redisDAO.hget(memGuidAdjust(memGuid), BRAND_QUALIFIER);
+        //return getResultFromHbase(memGuidAdjust(memGuid), COLUMN_FAMILY, BRAND_QUALIFIER);
+    }
+
+    @Override
+    public String getCategoryPreference(String memGuid) throws IOException {
+        LogBetter.instance(LOGGER).setLevel(LogLevel.INFO).setMsg("getCategoryPreference_TagDAOImpl="+memGuid).log();
+        return redisDAO.hget(memGuidAdjust(memGuid), CATEGORY_QUALIFIER);
+        //return getResultFromHbase(memGuidAdjust(memGuid), COLUMN_FAMILY, CATEGORY_QUALIFIER);
+    }
+
+    @Override
+    public String getLevel1Category(String memGuid) throws IOException {
+        LogBetter.instance(LOGGER).setLevel(LogLevel.INFO).setMsg("getLevel1Category_TagDAOImpl="+memGuid).log();
+        return redisDAO.hget(memGuidAdjust(memGuid), LEVEL1CATEGORY_QUALIFIER);
+//        return getResultFromHbase(memGuidAdjust(memGuid), COLUMN_FAMILY, LEVEL1CATEGORY_QUALIFIER);
+    }
+
+    private String getResultFromHbase(String rowKey, final String family, final String qual) throws IOException {
+        Get theGet = new Get(Bytes.toBytes(rowKey));
+        Result result = table.get(theGet);
+        if (result == null || result.isEmpty()) {
+            LogBetter.instance(LOGGER).setLevel(LogLevel.INFO).setMsg("TagDAOImpl_getResult=empty").log();
+            return "";
+        }
+        byte[] valueBytes = result.getValue(family.getBytes(), qual.getBytes());
+        String resultStr = "";
+        if(valueBytes != null) {
+            resultStr = Bytes.toString(valueBytes);
+        }
+        LogBetter.instance(LOGGER).setLevel(LogLevel.INFO).setMsg("TagDAOImpl_getResult=" + resultStr).log();
+
+        return resultStr;
+    }
+
+    private String getResultFromRedis(String rowKey, final String family, final String qual) throws IOException {
+        Get theGet = new Get(Bytes.toBytes(rowKey));
+        Result result = table.get(theGet);
+        if (result == null || result.isEmpty()) {
+            LogBetter.instance(LOGGER).setLevel(LogLevel.INFO).setMsg("TagDAOImpl_getResult=empty").log();
+            return "";
+        }
+        byte[] valueBytes = result.getValue(family.getBytes(), qual.getBytes());
+        String resultStr = "";
+        if(valueBytes != null) {
+            resultStr = Bytes.toString(valueBytes);
+        }
+        LogBetter.instance(LOGGER).setLevel(LogLevel.INFO).setMsg("TagDAOImpl_getResult=" + resultStr).log();
+
+        return resultStr;
+    }
+
+
+    private String memGuidAdjust(String memGuid) {
+        String memGuid1="";
+        if(memGuid.contains("=")) {
+            memGuid1 = memGuid.substring(memGuid.indexOf("=") + 1, memGuid.length());
+        } else {
+            memGuid1 = memGuid;
+        }
+        return memGuid1;
+    }
+}
