@@ -1,0 +1,165 @@
+package com.userprofile
+
+import org.apache.commons.pool2.impl.GenericObjectPoolConfig
+import org.apache.hadoop.fs.Path
+import org.apache.hadoop.hbase.client.Scan
+import org.apache.hadoop.hbase.spark.HBaseContext
+import org.apache.hadoop.hbase.util.Bytes
+import org.apache.hadoop.hbase.{HBaseConfiguration, TableName}
+import org.apache.spark.sql.catalyst.util.StringUtils
+import org.apache.spark.{SparkConf, SparkContext}
+import redis.clients.jedis.{Jedis, JedisShardInfo, Response, ShardedJedisPool}
+
+import scala.collection.mutable.ListBuffer
+
+object HbaseToRedis {
+  def main(args:Array[String]) {
+    val sparkConf = new SparkConf().setAppName("HBaseToES").set("spark.serializer", "org.apache.spark.serializer.KryoSerializer").set("spark.kryoserializer.buffer.max", "1024M")
+      .set("spark.driver.maxResultSize","20g").set("spark.default.parallelism","1640")
+    //.set("spark.storage.memoryFraction", "0.6")
+    sparkConf.set("es.index.auto.create", "true")
+    val sc = new SparkContext(sparkConf)
+    val conf = HBaseConfiguration.create()
+    conf.addResource(new Path("/etc/hbase/conf/core-site.xml"))
+    conf.addResource(new Path("/etc/hbase/conf/hbase-site.xml"))
+    val hbaseContext = new HBaseContext(sc, conf)
+    val scan = new Scan()
+    scan.setCaching(100)
+    scan.addColumn("tag".getBytes, "cc_brand_prefer".getBytes)
+    scan.addColumn("tag".getBytes, "br_prefer".getBytes)
+    scan.addColumn("tag".getBytes, "cat1top10".getBytes)
+    val tableName = TableName.valueOf("xx_recom:xx_user")
+    val getRdd = hbaseContext.hbaseRDD(tableName, scan)
+// 如果赋值为-1，则表示不限制；如果pool已经分配了maxActive个jedis实例，则此时pool的状态为exhausted(耗尽)，默认值是8。
+    val MAX_ACTIVE = 500;
+    val MIN_EVICTABLE_IDLE = 1800000
+    // 控制一个pool最多有多少个状态为idle(空闲的)的jedis实例，默认值也是8。
+    val MAX_IDLE = 100;
+    // 等待可用连接的最大时间，单位毫秒，默认值为-1，表示永不超时。如果超过等待时间，则直接抛出JedisConnectionException；
+    val MAX_WAIT = 3000;
+    // 超时时间，0永不超时
+    val TIMEOUT = 0;
+    
+    val poolConfig = new GenericObjectPoolConfig
+    poolConfig.setBlockWhenExhausted(true)
+    poolConfig.setMaxTotal(MAX_ACTIVE)
+    poolConfig.setMinEvictableIdleTimeMillis(MIN_EVICTABLE_IDLE)
+    poolConfig.setMaxIdle(MAX_IDLE)
+    poolConfig.setMaxWaitMillis(MAX_WAIT)
+    poolConfig.setTestOnBorrow(true)
+    poolConfig.setTestOnReturn(true)
+
+//    def getPoolConfig: GenericObjectPoolConfig = poolConfig
+
+    val shardsServerHostList = new java.util.ArrayList[JedisShardInfo]()
+    val si1 = new JedisShardInfo("recommend-redis01.idc1.fn", 6379)
+    val si2 = new JedisShardInfo("recommend-redis02.idc1.fn", 6379)
+    val si3 = new JedisShardInfo("recommend-redis03.idc1.fn", 6379)
+    val si4 = new JedisShardInfo("recommend-redis04.idc1.fn", 6379)
+    val si5 = new JedisShardInfo("recommend-redis05.idc1.fn", 6379)
+
+    shardsServerHostList.add(si1)
+    shardsServerHostList.add(si2)
+    shardsServerHostList.add(si3)
+    shardsServerHostList.add(si4)
+    shardsServerHostList.add(si5)
+
+    lazy val jedisShardedPool = new ShardedJedisPool(poolConfig, shardsServerHostList)
+    lazy val shardedJedis = jedisShardedPool.getResource
+
+
+    val arr = getRdd.distinct()  //.take(100)
+    val keyArr1 = for(e <- arr.take(1000)) yield new String(e._1.get())
+    val keyArr = for(e <- arr) yield new String(e._1.get())
+
+    arr.foreachPartition(partition => {
+      val poolConfig = new GenericObjectPoolConfig
+      poolConfig.setBlockWhenExhausted(true)
+      poolConfig.setMaxTotal(MAX_ACTIVE)
+      poolConfig.setMinEvictableIdleTimeMillis(MIN_EVICTABLE_IDLE)
+      poolConfig.setMaxIdle(MAX_IDLE)
+      poolConfig.setMaxWaitMillis(MAX_WAIT)
+      poolConfig.setTestOnBorrow(true)
+      poolConfig.setTestOnReturn(true)
+
+      val shardsServerHostList = new java.util.ArrayList[JedisShardInfo]()
+      val si1 = new JedisShardInfo("recommend-redis01.idc1.fn", 6379)
+      val si2 = new JedisShardInfo("recommend-redis02.idc1.fn", 6379)
+      val si3 = new JedisShardInfo("recommend-redis03.idc1.fn", 6379)
+      val si4 = new JedisShardInfo("recommend-redis04.idc1.fn", 6379)
+      val si5 = new JedisShardInfo("recommend-redis05.idc1.fn", 6379)
+
+      shardsServerHostList.add(si1)
+      shardsServerHostList.add(si2)
+      shardsServerHostList.add(si3)
+      shardsServerHostList.add(si4)
+      shardsServerHostList.add(si5)
+
+      lazy val jedisShardedPool = new ShardedJedisPool(poolConfig, shardsServerHostList)
+      lazy val shardedJedis = jedisShardedPool.getResource
+      val pipeline = shardedJedis.pipelined
+      partition.foreach(line => {
+        val tagMap = new java.util.HashMap[String, String]()
+        val result = line._2
+        /*
+      String row = Bytes.toString(result.getRow());
+      val row = Bytes.toString(cell.getRowArray(), cell.getRowOffset(), cell.getRowLength());
+      val cell = result.getColumnLatestCell("tag".getBytes, "cc_brand_prefer".getBytes)
+      val value1 = Bytes.toString(cell.getValueArray(), cell.getValueOffset(), cell.getValueLength());*/
+        var resultValue: String = null
+        if (result.containsNonEmptyColumn(Bytes.toBytes("tag"), Bytes.toBytes("cc_brand_prefer"))) {
+          resultValue = Bytes.toString(result.getValue(Bytes.toBytes("tag"), Bytes.toBytes("cc_brand_prefer")))
+          if (resultValue != null && resultValue.length > 2) {
+            tagMap.put("cc_brand_prefer", resultValue)
+          }
+        }
+        if (result.containsNonEmptyColumn(Bytes.toBytes("tag"), Bytes.toBytes("br_prefer"))) {
+          resultValue = Bytes.toString(result.getValue(Bytes.toBytes("tag"), Bytes.toBytes("br_prefer")))
+          if (resultValue != null && resultValue.length > 2) {
+            tagMap.put("br_prefer", resultValue)
+          }
+        }
+        if (result.containsNonEmptyColumn(Bytes.toBytes("tag"), Bytes.toBytes("cat1top10"))) {
+          resultValue = Bytes.toString(result.getValue(Bytes.toBytes("tag"), Bytes.toBytes("cat1top10")))
+          if (resultValue != null && resultValue.length > 2) {
+            tagMap.put("cat1top10", resultValue)
+          }
+        }
+
+        val userId = Bytes.toString(line._1.get())
+        if (!tagMap.isEmpty)
+          pipeline.hmset(userId, tagMap)
+      })
+      pipeline.sync()
+      shardedJedis.close
+      jedisShardedPool.destroy
+    })
+
+
+    val pipeline = shardedJedis.pipelined
+    var tempRedisRes = Map[String, Response[java.util.List[String]]]()
+    var existRes = Map[String, Response[java.lang.Boolean]]()
+    // Redis 操作……
+    for(user_id <- keyArr){
+      existRes ++= Map(user_id -> pipeline.exists(user_id))
+      tempRedisRes ++= Map(user_id -> pipeline.hmget(user_id, "cc_brand_prefer", "br_prefer", "cat1top10"))
+    }
+
+    pipeline.sync()
+    // Redis 操作完毕
+    shardedJedis.close
+    jedisShardedPool.destroy
+
+    tempRedisRes.foreach(e => {
+      if(existRes.get(e._1).get.get()) {
+        println(e._1 + " ")
+        for (elem <- e._2.get().toArray()) {
+          println(" " + elem)
+        }
+      }
+    })
+
+    println("finished")
+    sc.stop()
+  }
+}
